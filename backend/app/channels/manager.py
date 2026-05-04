@@ -294,37 +294,19 @@ def _accumulate_stream_text(
 
 
 def _extract_artifacts(result: dict | list) -> list[str]:
-    """Extract artifact paths from the last AI response cycle only.
+    """Extract artifact paths from the accumulated artifacts state.
 
-    Instead of reading the full accumulated ``artifacts`` state (which contains
-    all artifacts ever produced in the thread), this inspects the messages after
-    the last human message and collects file paths from ``present_files`` tool
-    calls.  This ensures only newly-produced artifacts are returned.
+    Reads the already-normalized virtual paths from the ``artifacts`` state
+    key. ``present_file_tool`` normalises every path to
+    ``/mnt/user-data/outputs/<filename>`` before writing it to state, so
+    reading state guarantees that every returned path passes the
+    ``_OUTPUTS_VIRTUAL_PREFIX`` check in ``_resolve_attachments``.
     """
-    if isinstance(result, list):
-        messages = result
-    elif isinstance(result, dict):
-        messages = result.get("messages", [])
-    else:
-        return []
-
-    artifacts: list[str] = []
-    for msg in reversed(messages):
-        if not isinstance(msg, dict):
-            continue
-        # Stop at the last human message — anything before it is a previous turn
-        if msg.get("type") == "human":
-            break
-        # Look for AI messages with present_files tool calls
-        if msg.get("type") == "ai":
-            for tc in msg.get("tool_calls", []):
-                if isinstance(tc, dict) and tc.get("name") == "present_files":
-                    args = tc.get("args", {})
-                    paths = args.get("filepaths", [])
-                    if isinstance(paths, list):
-                        artifacts.extend(p for p in paths if isinstance(p, str))
-    return artifacts
-
+    if isinstance(result, dict):
+        artifacts_state = result.get("artifacts", [])
+        if isinstance(artifacts_state, list):
+            return [p for p in artifacts_state if isinstance(p, str)]
+    return []
 
 def _format_artifact_text(artifacts: list[str]) -> str:
     """Format artifact paths into a human-readable text block listing filenames."""
