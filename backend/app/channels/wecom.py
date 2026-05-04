@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 # 企业微信流式消息超时错误码 (10分钟无更新导致 stream 失效)
 WECOM_STREAM_TIMEOUT_ERRCODE = 846608
+# Layer 1: 预防性超时阈值 (9分钟，提前触发 fallback)
+WECOM_STREAM_TIMEOUT_THRESHOLD = 540
 
 
 class WeComChannel(Channel):
@@ -33,6 +35,9 @@ class WeComChannel(Channel):
         self._working_message = "Working on it..."
         # 记录已 fallback 的 stream，避免重复尝试
         self._stream_timeout_fallback: dict[str, bool] = {}
+        # Layer 1: 预防性超时监控
+        self._stream_monitors: dict[str, asyncio.Task] = {}
+        self._stream_start_times: dict[str, float] = {}
 
     @property
     def supports_streaming(self) -> bool:
@@ -41,19 +46,25 @@ class WeComChannel(Channel):
     def _clear_ws_context(self, thread_ts: str | None) -> None:
         if not thread_ts:
             return
+        # Layer 1: 清理监控任务
+        monitor_task = self._stream_monitors.pop(thread_ts, None)
+        if monitor_task:
+            monitor_task.cancel()
+        self._stream_start_times.pop(thread_ts, None)
+        # 原有清理
         self._ws_frames.pop(thread_ts, None)
         self._ws_stream_ids.pop(thread_ts, None)
         self._stream_timeout_fallback.pop(thread_ts, None)
 
     def _is_stream_timeout_error(self, exc: Exception) -> bool:
         """检测企业微信流式消息超时错误 (errcode=846608)
-        
+
         企业微信 WebSocket stream 在长时间无更新时会超时失效，
         需要识别此错误并自动 fallback 到普通消息发送。
         """
         # 检查异常对象是否包含 errcode 信息
         error_dict = None
-        
+
         # 尝试从异常属性中提取
         if hasattr(exc, "error"):
             error_dict = getattr(exc, "error", None)
@@ -61,7 +72,7 @@ class WeComChannel(Channel):
             response = getattr(exc, "response", None)
             if isinstance(response, dict):
                 error_dict = response
-        
+
         # 尝试从异常消息字符串解析
         if not error_dict:
             exc_str = str(exc)
@@ -69,25 +80,73 @@ class WeComChannel(Channel):
                 return True
             if "846608" in exc_str:
                 return True
-        
+
         # 检查 error_dict
         if isinstance(error_dict, dict):
             errcode = error_dict.get("errcode")
             if errcode == WECOM_STREAM_TIMEOUT_ERRCODE:
                 return True
-        
+
         return False
 
-    async def _send_ws_upload_command(self, req_id: str, body: dict[str, Any], cmd: str) -> dict[str, Any]:
+    async def _monitor_stream_timeout(self, thread_ts: str) -> None:
+        """Layer 1: 预防性超时监控
+
+        在 stream 开始后启动，监控 elapsed 时间。
+        超过阈值（540s）后主动触发 fallback，避免等待服务端超时。
+        """
+        try:
+            await asyncio.sleep(WECOM_STREAM_TIMEOUT_THRESHOLD)
+
+            # 检查 stream 是否仍在进行
+            if thread_ts not in self._ws_stream_ids:
+                return  # stream 已结束
+
+            elapsed = asyncio.get_event_loop().time() - self._stream_start_times.get(thread_ts, 0)
+            if elapsed >= WECOM_STREAM_TIMEOUT_THRESHOLD:
+                logger.warning(
+                    "[WeCom] stream approaching timeout (elapsed=%.1fs), proactively triggering fallback for thread_ts=%s",
+                    elapsed,
+                    thread_ts,
+                )
+                self._stream_timeout_fallback[thread_ts] = True
+
+            # 清理监控任务
+            self._stream_monitors.pop(thread_ts, None)
+            self._stream_start_times.pop(thread_ts, None)
+        except asyncio.CancelledError:
+            # stream 正常结束，监控任务被取消
+            logger.debug("[WeCom] stream monitor cancelled for thread_ts=%s", thread_ts)
+        except Exception:
+            logger.exception("[WeCom] stream monitor error for thread_ts=%s", thread_ts)
+
+    def _start_stream_monitor(self, thread_ts: str) -> None:
+        """Layer 1: 启动预防性超时监控任务"""
+        if thread_ts in self._stream_monitors:
+            return  # 已有监控任务
+
+        self._stream_start_times[thread_ts] = asyncio.get_event_loop().time()
+        self._stream_monitors[thread_ts] = asyncio.create_task(
+            self._monitor_stream_timeout(thread_ts)
+        )
+        logger.debug("[WeCom] started stream monitor for thread_ts=%s", thread_ts)
+
+    async def _send_ws_upload_command(
+        self, req_id: str, body: dict[str, Any], cmd: str
+    ) -> dict[str, Any]:
         if not self._ws_client:
             raise RuntimeError("WeCom WebSocket client is not available")
 
         ws_manager = getattr(self._ws_client, "_ws_manager", None)
         send_reply = getattr(ws_manager, "send_reply", None)
         if not callable(send_reply):
-            raise RuntimeError("Installed wecom-aibot-python-sdk does not expose the WebSocket media upload API expected by DeerFlow. Use wecom-aibot-python-sdk==0.1.6 or update the adapter.")
+            raise RuntimeError(
+                "Installed wecom-aibot-python-sdk does not expose the WebSocket media upload API expected by DeerFlow. Use wecom-aibot-python-sdk==0.1.6 or update the adapter."
+            )
 
-        send_reply_async = cast(Callable[[str, dict[str, Any], str], Awaitable[dict[str, Any]]], send_reply)
+        send_reply_async = cast(
+            Callable[[str, dict[str, Any], str], Awaitable[dict[str, Any]]], send_reply
+        )
         return await send_reply_async(req_id, body, cmd)
 
     async def start(self) -> None:
@@ -100,7 +159,11 @@ class WeComChannel(Channel):
 
         self._bot_id = bot_id if isinstance(bot_id, str) and bot_id else None
         self._bot_secret = bot_secret if isinstance(bot_secret, str) and bot_secret else None
-        self._working_message = working_message if isinstance(working_message, str) and working_message else "Working on it..."
+        self._working_message = (
+            working_message
+            if isinstance(working_message, str) and working_message
+            else "Working on it..."
+        )
 
         if not self._bot_id or not self._bot_secret:
             logger.error("WeCom channel requires bot_id and bot_secret")
@@ -109,16 +172,20 @@ class WeComChannel(Channel):
         try:
             from aibot import WSClient, WSClientOptions
         except ImportError:
-            logger.error("wecom-aibot-python-sdk is not installed. Install it with: uv add wecom-aibot-python-sdk")
+            logger.error(
+                "wecom-aibot-python-sdk is not installed. Install it with: uv add wecom-aibot-python-sdk"
+            )
             return
         else:
-            self._ws_client = WSClient(WSClientOptions(bot_id=self._bot_id, secret=self._bot_secret, logger=logger))
+            self._ws_client = WSClient(
+                WSClientOptions(bot_id=self._bot_id, secret=self._bot_secret, logger=logger)
+            )
             self._ws_client.on("message.text", self._on_ws_text)
             self._ws_client.on("message.mixed", self._on_ws_mixed)
             self._ws_client.on("message.image", self._on_ws_image)
             self._ws_client.on("message.file", self._on_ws_file)
-            self._ws_task = asyncio.create_task(self._ws_client.connect())
 
+            self._ws_task = asyncio.create_task(self._ws_client.connect())
             self._running = True
             self.bus.subscribe_outbound(self._on_outbound)
             logger.info("WeCom channel started")
@@ -141,6 +208,15 @@ class WeComChannel(Channel):
                 pass
             self._ws_client = None
 
+        # Layer 1: 清理所有监控任务
+        for task in self._stream_monitors.values():
+            try:
+                task.cancel()
+            except Exception:
+                pass
+        self._stream_monitors.clear()
+        self._stream_start_times.clear()
+
         self._ws_frames.clear()
         self._ws_stream_ids.clear()
         self._stream_timeout_fallback.clear()
@@ -150,13 +226,11 @@ class WeComChannel(Channel):
         if self._ws_client:
             await self._send_ws(msg, _max_retries=_max_retries)
             return
-
         logger.warning("[WeCom] send called but WebSocket client is not available")
 
     async def _on_outbound(self, msg: OutboundMessage) -> None:
         if msg.channel_name != self.name:
             return
-
         try:
             await self.send(msg)
         except Exception:
@@ -170,9 +244,13 @@ class WeComChannel(Channel):
             try:
                 success = await self.send_file(msg, attachment)
                 if not success:
-                    logger.warning("[%s] file upload skipped for %s", self.name, attachment.filename)
+                    logger.warning(
+                        "[%s] file upload skipped for %s", self.name, attachment.filename
+                    )
             except Exception:
-                logger.exception("[%s] failed to upload file %s", self.name, attachment.filename)
+                logger.exception(
+                    "[%s] failed to upload file %s", self.name, attachment.filename
+                )
 
         if msg.is_final:
             self._clear_ws_context(msg.thread_ts)
@@ -180,10 +258,8 @@ class WeComChannel(Channel):
     async def send_file(self, msg: OutboundMessage, attachment: ResolvedAttachment) -> bool:
         if not msg.is_final:
             return True
-
         if not self._ws_client:
             return False
-
         if not msg.thread_ts:
             return False
 
@@ -193,7 +269,6 @@ class WeComChannel(Channel):
 
         media_type = "image" if attachment.is_image else "file"
         size_limit = 2 * 1024 * 1024 if attachment.is_image else 20 * 1024 * 1024
-
         if attachment.size > size_limit:
             logger.warning(
                 "[WeCom] %s too large (%d bytes), skipping: %s",
@@ -225,20 +300,18 @@ class WeComChannel(Channel):
         body = frame.get("body", {}) or {}
         text = ((body.get("text") or {}).get("content") or "").strip()
         quote = body.get("quote", {}).get("text", {}).get("content", "").strip()
-
         if not text and not quote:
             return
-
-        await self._publish_ws_inbound(frame, text + (f"\nQuote message: {quote}" if quote else ""))
+        await self._publish_ws_inbound(
+            frame, text + (f"\nQuote message: {quote}" if quote else "")
+        )
 
     async def _on_ws_mixed(self, frame: dict[str, Any]) -> None:
         body = frame.get("body", {}) or {}
         mixed = body.get("mixed") or {}
         items = mixed.get("msg_item") or []
-
         parts: list[str] = []
         files: list[dict[str, Any]] = []
-
         for item in items:
             item_type = (item or {}).get("msgtype")
             if item_type == "text":
@@ -254,17 +327,16 @@ class WeComChannel(Channel):
                         {
                             "type": item_type,
                             "url": url,
-                            "aeskey": (aeskey if isinstance(aeskey, str) and aeskey else None),
+                            "aeskey": (
+                                aeskey if isinstance(aeskey, str) and aeskey else None
+                            ),
                         }
                     )
-
         text = "\n\n".join(parts).strip()
         if not text and not files:
             return
-
         if not text:
             text = "（receive image/file）"
-
         await self._publish_ws_inbound(frame, text, files=files)
 
     async def _on_ws_image(self, frame: dict[str, Any]) -> None:
@@ -272,10 +344,8 @@ class WeComChannel(Channel):
         image = body.get("image") or {}
         url = image.get("url")
         aeskey = image.get("aeskey")
-
         if not isinstance(url, str) or not url:
             return
-
         await self._publish_ws_inbound(
             frame,
             "（receive image ）",
@@ -293,10 +363,8 @@ class WeComChannel(Channel):
         file_obj = body.get("file") or {}
         url = file_obj.get("url")
         aeskey = file_obj.get("aeskey")
-
         if not isinstance(url, str) or not url:
             return
-
         await self._publish_ws_inbound(
             frame,
             "（receive file）",
@@ -310,15 +378,10 @@ class WeComChannel(Channel):
         )
 
     async def _publish_ws_inbound(
-        self,
-        frame: dict[str, Any],
-        text: str,
-        *,
-        files: list[dict[str, Any]] | None = None,
+        self, frame: dict[str, Any], text: str, *, files: list[dict[str, Any]] | None = None
     ) -> None:
         if not self._ws_client:
             return
-
         try:
             from aibot import generate_req_id
         except Exception:
@@ -330,9 +393,7 @@ class WeComChannel(Channel):
             return
 
         user_id = (body.get("from") or {}).get("userid")
-
         inbound_type = InboundMessageType.COMMAND if text.startswith("/") else InboundMessageType.CHAT
-
         inbound = self._make_inbound(
             chat_id=user_id,  # keep user's conversation in memory
             user_id=user_id,
@@ -342,26 +403,30 @@ class WeComChannel(Channel):
             files=files or [],
             metadata={"aibotid": body.get("aibotid"), "chattype": body.get("chattype")},
         )
-        inbound.topic_id = user_id  # keep the same thread
+        inbound.topic_id = user_id
 
+        # keep the same thread
         stream_id = generate_req_id("stream")
         self._ws_frames[msg_id] = frame
         self._ws_stream_ids[msg_id] = stream_id
+
+        # Layer 1: 启动预防性超时监控
+        self._start_stream_monitor(msg_id)
 
         try:
             await self._ws_client.reply_stream(frame, stream_id, self._working_message, False)
         except Exception:
             pass
-
         await self.bus.publish_inbound(inbound)
 
     async def _send_ws(self, msg: OutboundMessage, *, _max_retries: int = 3) -> None:
         """发送 WebSocket 消息，支持超时自动 fallback
-        
+
         改进点：
         1. 检测 errcode=846608 (stream 超时错误)
         2. 超时后自动 fallback 到普通消息发送
         3. 避免重复 fallback 尝试
+        4. Layer 1: 预防性超时监控（9分钟阈值）
         """
         if not self._ws_client:
             return
@@ -374,7 +439,6 @@ class WeComChannel(Channel):
         if msg.thread_ts and msg.thread_ts in self._ws_frames:
             frame = self._ws_frames[msg.thread_ts]
             stream_id = self._ws_stream_ids.get(msg.thread_ts)
-
             if not stream_id and generate_req_id:
                 stream_id = generate_req_id("stream")
                 self._ws_stream_ids[msg.thread_ts] = stream_id
@@ -395,7 +459,6 @@ class WeComChannel(Channel):
                     return
                 except Exception as exc:
                     last_exc = exc
-                    
                     # 关键改进：检测 stream 超时错误并自动 fallback
                     if self._is_stream_timeout_error(exc):
                         logger.warning(
@@ -406,7 +469,6 @@ class WeComChannel(Channel):
                         self._stream_timeout_fallback[msg.thread_ts] = True
                         await self._fallback_to_send_message(msg.chat_id, msg.text, _max_retries)
                         return
-                    
                     if attempt < _max_retries - 1:
                         await asyncio.sleep(2**attempt)
 
@@ -430,15 +492,15 @@ class WeComChannel(Channel):
 
     async def _fallback_to_send_message(self, chat_id: str, text: str, max_retries: int = 3) -> None:
         """Fallback 到普通消息发送
-        
+
         当 stream 超时失效时，使用 send_message 发送普通消息作为兜底方案。
         """
         if not self._ws_client:
             return
-        
+
         body = {"msgtype": "markdown", "markdown": {"content": text}}
         last_exc: Exception | None = None
-        
+
         for attempt in range(max_retries):
             try:
                 await self._ws_client.send_message(chat_id, body)
@@ -448,7 +510,7 @@ class WeComChannel(Channel):
                 last_exc = exc
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2**attempt)
-        
+
         if last_exc:
             logger.error("[WeCom] fallback send_message failed: %s", last_exc)
 
@@ -470,7 +532,6 @@ class WeComChannel(Channel):
 
         chunk_size = 512 * 1024
         total_chunks = (size + chunk_size - 1) // chunk_size
-
         if total_chunks < 1 or total_chunks > 100:
             logger.warning("[WeCom] invalid total_chunks=%d for %s", total_chunks, filename)
             return None
@@ -489,10 +550,8 @@ class WeComChannel(Channel):
             "total_chunks": int(total_chunks),
             "md5": md5,
         }
-
         init_ack = await self._send_ws_upload_command(init_req_id, init_body, "aibot_upload_media_init")
         upload_id = (init_ack.get("body") or {}).get("upload_id")
-
         if not upload_id:
             logger.warning("[WeCom] upload init returned no upload_id: %s", init_ack)
             return None
@@ -502,19 +561,18 @@ class WeComChannel(Channel):
                 data = f.read(chunk_size)
                 if not data:
                     break
-
                 chunk_req_id = generate_req_id("aibot_upload_media_chunk")
                 chunk_body = {
                     "upload_id": upload_id,
                     "chunk_index": int(idx),
                     "base64_data": base64.b64encode(data).decode("utf-8"),
                 }
-
                 await self._send_ws_upload_command(chunk_req_id, chunk_body, "aibot_upload_media_chunk")
 
         finish_req_id = generate_req_id("aibot_upload_media_finish")
-        finish_ack = await self._send_ws_upload_command(finish_req_id, {"upload_id": upload_id}, "aibot_upload_media_finish")
-
+        finish_ack = await self._send_ws_upload_command(
+            finish_req_id, {"upload_id": upload_id}, "aibot_upload_media_finish"
+        )
         media_id = (finish_ack.get("body") or {}).get("media_id")
         if not media_id:
             logger.warning("[WeCom] upload finish returned no media_id: %s", finish_ack)
